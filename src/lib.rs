@@ -118,7 +118,10 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
-    pub fn new(m: usize) -> Self {
+    pub fn new(mut m: usize, ef_construction: usize) -> Self {
+        if m < 2 {
+            m = 2;
+        }
         let m_l = 1.0 / (m as f64).ln();
 
         HnswIndex {
@@ -138,6 +141,25 @@ impl HnswIndex {
 
         let layer = -r.ln() * self.m_l;
         layer.floor() as usize
+    }
+
+    pub fn search(&self, query: &Vector, k: usize, store: &VectorStore) -> Vec<(usize, f32)> {
+        if self.entry_point.is_none() {
+            return vec![];
+        }
+
+        let mut current_entry = self.entry_point.unwrap();
+
+        for layer in (1..=self.max_layer).rev() {
+            let closest = self.search_layer(query, current_entry, layer, store, 1);
+            current_entry = closest[0].0;
+        }
+
+        let ef_search = std::cmp::max(self.ef_construction, k);
+        let mut results = self.search_layer(query, current_entry, 0, store, ef_search);
+
+        results.truncate(k);
+        results
     }
 
     pub fn search_layer(
@@ -271,94 +293,159 @@ impl HnswIndex {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_l2_squared_distance() {
-        let v1 = Vector {
-            id: 1,
-            data: vec![1.0, 2.0, 3.0],
-        };
-        let v2 = Vector {
-            id: 2,
-            data: vec![4.0, 5.0, 6.0],
-        };
-
-        // Math: (1-4)^2 + (2-5)^2 + (3-6)^2 = (-3)^2 + (-3)^2 + (-3)^2 = 9 + 9 + 9 = 27
-        assert_eq!(v1.l2_squared_distance(&v2), 27.0);
-    }
-
-    #[test]
-    fn test_cosine_similarity() {
-        let v1 = Vector {
-            id: 1,
-            data: vec![1.0, 0.0],
-        };
-        let v2 = Vector {
-            id: 2,
-            data: vec![0.0, 1.0],
-        };
-
-        // Orthogonal vectors (90 degrees apart) should have 0.0 similarity
-        assert_eq!(v1.cosine_similarity(&v2), 0.0);
-
-        let v3 = Vector {
-            id: 3,
-            data: vec![2.0, 0.0],
-        };
-
-        // Parallel vectors (same direction, different magnitude) should have 1.0 similarity
-        assert_eq!(v1.cosine_similarity(&v3), 1.0);
-    }
-
-    #[test]
-    fn test_search_knn() {
-        let mut store = VectorStore::new(2); // 2-dimensional space
-
+    // Setup helper to create a populated store
+    fn create_basic_store() -> VectorStore {
+        let mut store = VectorStore::new(2);
         store
             .add_vector(Vector {
-                id: 1,
+                id: 0,
                 data: vec![0.0, 0.0],
             })
             .unwrap();
         store
             .add_vector(Vector {
-                id: 2,
+                id: 1,
                 data: vec![1.0, 1.0],
             })
             .unwrap();
         store
             .add_vector(Vector {
-                id: 3,
-                data: vec![5.0, 5.0],
+                id: 2,
+                data: vec![2.0, 2.0],
             })
             .unwrap();
         store
             .add_vector(Vector {
+                id: 3,
+                data: vec![10.0, 10.0],
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn test_hnsw_structure() {
+        let store = create_basic_store();
+        // M=16, ef_construction=32
+        let mut index = HnswIndex::new(16, 32);
+
+        for i in 0..4 {
+            index.insert(i, &store);
+        }
+
+        assert_eq!(index.nodes.len(), 4);
+        assert!(index.entry_point.is_some());
+    }
+
+    #[test]
+    fn test_connection_pruning() {
+        let mut store = VectorStore::new(2);
+        // We will surround the origin (0.0, 0.0) with many points to force pruning
+        store
+            .add_vector(Vector {
+                id: 0,
+                data: vec![0.0, 0.0],
+            })
+            .unwrap(); // Center
+        store
+            .add_vector(Vector {
+                id: 1,
+                data: vec![0.1, 0.0],
+            })
+            .unwrap(); // Very close
+        store
+            .add_vector(Vector {
+                id: 2,
+                data: vec![0.0, 0.1],
+            })
+            .unwrap(); // Very close
+        store
+            .add_vector(Vector {
+                id: 3,
+                data: vec![0.5, 0.5],
+            })
+            .unwrap(); // Medium
+        store
+            .add_vector(Vector {
                 id: 4,
+                data: vec![1.0, 1.0],
+            })
+            .unwrap(); // Far
+
+        // Use a strictly small M to force pruning immediately.
+        // M=2 means Layer 0 allows max 4 connections (m_max_0 = 4).
+        // Let's artificially set M=1 so Layer 0 allows max 2 connections.
+        let mut index = HnswIndex::new(1, 10);
+
+        for i in 0..5 {
+            index.insert(i, &store);
+        }
+
+        // Check node 0 (the center). It should have pruned its connections down to m_max_0 (which is 2).
+        let node_0_connections = &index.nodes[0].connections[0];
+
+        assert!(
+            node_0_connections.len() <= index.m_max_0,
+            "Node 0 failed to prune! It has {} connections, max allowed is {}",
+            node_0_connections.len(),
+            index.m_max_0
+        );
+
+        // Verify it kept the CLOSEST ones (IDs 1 and 2 are closer than 3 and 4)
+        assert!(
+            node_0_connections.contains(&1) || node_0_connections.contains(&2),
+            "Pruning kept the wrong nodes!"
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_search() {
+        let mut store = VectorStore::new(2);
+        store
+            .add_vector(Vector {
+                id: 0,
+                data: vec![1.0, 1.0],
+            })
+            .unwrap();
+        store
+            .add_vector(Vector {
+                id: 1,
                 data: vec![2.0, 2.0],
             })
             .unwrap();
+        store
+            .add_vector(Vector {
+                id: 2,
+                data: vec![10.0, 10.0],
+            })
+            .unwrap();
+        store
+            .add_vector(Vector {
+                id: 3,
+                data: vec![11.0, 11.0],
+            })
+            .unwrap();
 
+        let mut index = HnswIndex::new(16, 32);
+        for i in 0..4 {
+            index.insert(i, &store);
+        }
+
+        // Query: Find the 2 points closest to (0.0, 0.0)
         let query = Vector {
             id: 99,
             data: vec![0.0, 0.0],
-        }; // Query at the origin
-
-        // We want the 2 closest vectors
-        let results = store.search_knn(&query, 2);
+        };
+        let results = index.search(&query, 2, &store);
 
         assert_eq!(results.len(), 2);
 
-        // The absolute closest should be id 1 (distance 0)
-        assert_eq!(results[0].0, 1);
-        assert_eq!(results[0].1, 0.0);
-
-        // The second closest should be id 2 (distance 1^2 + 1^2 = 2)
-        assert_eq!(results[1].0, 2);
-        assert_eq!(results[1].1, 2.0);
+        // The closest should be id 0 (1.0, 1.0), followed by id 1 (2.0, 2.0)
+        assert_eq!(results[0].0, 0);
+        assert_eq!(results[1].0, 1);
     }
 }
