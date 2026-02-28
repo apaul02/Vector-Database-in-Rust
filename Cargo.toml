@@ -3,6 +3,13 @@ name = "vector_db_core"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "my_vector_db"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 ordered-float = "5.1.0"
 rand = "0.10.0"
+memmap2 = "0.9.10"
+bytemuck = "1.25.0"
+pyo3 = { version = "0.28.2", features = ["extension-module"]}

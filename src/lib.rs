@@ -1,11 +1,23 @@
+pub mod disk_store;
 use core::f64;
 use ordered_float::OrderedFloat;
-use rand::{Rng, RngExt};
-use std::cmp::Reverse;
-use std::{
-    collections::{BinaryHeap, HashSet},
-    vec,
-};
+use rand::RngExt;
+use std::{collections::BinaryHeap, vec};
+
+pub trait Storage {
+    fn get_vector(&self, id: usize) -> &[f32];
+    fn len(&self) -> usize;
+}
+
+impl Storage for VectorStore {
+    fn get_vector(&self, id: usize) -> &[f32] {
+        &self.vectors[id].data
+    }
+
+    fn len(&self) -> usize {
+        self.vectors.len()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Vector {
@@ -13,31 +25,25 @@ pub struct Vector {
     pub data: Vec<f32>,
 }
 
-impl Vector {
-    pub fn l2_squared_distance(&self, other: &Vector) -> f32 {
-        self.data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| (a - b).powi(2))
-            .sum()
+pub fn l2_squared_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
+}
+
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot_product = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot_product += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
     }
 
-    pub fn cosine_similarity(&self, other: &Vector) -> f32 {
-        let mut dot_product = 0.0;
-        let mut norm_a = 0.0;
-        let mut norm_b = 0.0;
-
-        for (a, b) in self.data.iter().zip(other.data.iter()) {
-            dot_product += a * b;
-            norm_a += a * a;
-            norm_b += b * b;
-        }
-
-        if norm_a == 0.0 || norm_b == 0.0 {
-            return 0.0;
-        }
-        dot_product / (norm_a.sqrt() * norm_b.sqrt())
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
     }
+    dot_product / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 pub struct VectorStore {
@@ -69,7 +75,7 @@ impl VectorStore {
         let mut heap: BinaryHeap<(OrderedFloat<f32>, usize)> = BinaryHeap::new();
 
         for v in &self.vectors {
-            let dist = query.l2_squared_distance(v);
+            let dist = l2_squared_distance(&query.data, &v.data);
 
             if heap.len() < k {
                 heap.push((OrderedFloat(dist), v.id));
@@ -143,7 +149,7 @@ impl HnswIndex {
         layer.floor() as usize
     }
 
-    pub fn search(&self, query: &Vector, k: usize, store: &VectorStore) -> Vec<(usize, f32)> {
+    pub fn search(&self, query: &[f32], k: usize, store: &dyn Storage) -> Vec<(usize, f32)> {
         if self.entry_point.is_none() {
             return vec![];
         }
@@ -164,10 +170,10 @@ impl HnswIndex {
 
     pub fn search_layer(
         &self,
-        query: &Vector,
+        query: &[f32], // Changed to raw slice
         entry_point_id: usize,
         layer: usize,
-        store: &VectorStore,
+        store: &dyn Storage,
         ef: usize,
     ) -> Vec<(usize, f32)> {
         use ordered_float::OrderedFloat;
@@ -177,7 +183,8 @@ impl HnswIndex {
         let mut visited = HashSet::new();
         visited.insert(entry_point_id);
 
-        let ep_dist = query.l2_squared_distance(&store.vectors[entry_point_id]);
+        // Updated to use the standalone math function
+        let ep_dist = l2_squared_distance(query, store.get_vector(entry_point_id));
 
         let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>> = BinaryHeap::new();
         candidates.push(Reverse((OrderedFloat(ep_dist), entry_point_id)));
@@ -193,8 +200,8 @@ impl HnswIndex {
 
             for &neighbor_id in &self.nodes[cand_id].connections[layer] {
                 if visited.insert(neighbor_id) {
-                    let neighbor_vec = &store.vectors[neighbor_id];
-                    let dist = query.l2_squared_distance(neighbor_vec);
+                    let neighbor_vec = store.get_vector(neighbor_id);
+                    let dist = l2_squared_distance(query, neighbor_vec);
 
                     let furthest_res_dist = top_results.peek().unwrap().0.into_inner();
 
@@ -218,8 +225,7 @@ impl HnswIndex {
 
         results
     }
-
-    pub fn insert(&mut self, vector_id: usize, store: &VectorStore) {
+    pub fn insert(&mut self, vector_id: usize, store: &dyn Storage) {
         let new_node_level = self.generate_random_layer();
         let mut new_node = HnswNode::new(vector_id, new_node_level);
 
@@ -231,7 +237,7 @@ impl HnswIndex {
         }
 
         let mut current_entry = self.entry_point.unwrap();
-        let query_vec = &store.vectors[vector_id];
+        let query_vec = store.get_vector(vector_id);
 
         let mut current_level = self.max_layer;
 
@@ -263,12 +269,14 @@ impl HnswIndex {
                 existing_node_connections.push(vector_id);
 
                 if existing_node_connections.len() > m_max {
-                    let existing_vec = &store.vectors[closest_id];
+                    // Updated to use the trait method
+                    let existing_vec = store.get_vector(closest_id);
 
                     let mut distances: Vec<(usize, f32)> = existing_node_connections
                         .iter()
                         .map(|&conn_id| {
-                            let dist = existing_vec.l2_squared_distance(&store.vectors[conn_id]);
+                            // Updated to use the standalone math function
+                            let dist = l2_squared_distance(existing_vec, store.get_vector(conn_id));
                             (conn_id, dist)
                         })
                         .collect();
@@ -292,6 +300,62 @@ impl HnswIndex {
             self.entry_point = Some(vector_id);
         }
     }
+}
+
+// --- PyO3 Python Bindings ---
+use pyo3::exceptions::PyIOError;
+use pyo3::prelude::*;
+
+/// This is the class that will be exposed to Python.
+#[pyclass]
+pub struct VectorDB {
+    index: HnswIndex,
+    store: crate::disk_store::MmapVectorStore,
+}
+
+#[pymethods]
+impl VectorDB {
+    /// Python Constructor: db = VectorDB("mock_data.bin", 384, 16, 32)
+    #[new]
+    fn new(
+        file_path: String,
+        dimensions: usize,
+        m: usize,
+        ef_construction: usize,
+    ) -> PyResult<Self> {
+        // Open the memory-mapped file
+        let store = crate::disk_store::MmapVectorStore::open(&file_path, dimensions)
+            .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?;
+
+        let index = HnswIndex::new(m, ef_construction);
+
+        Ok(VectorDB { index, store })
+    }
+
+    /// Tells the Rust engine to insert a range of vectors from the mmap file into the HNSW graph
+    fn build_index(&mut self, start_id: usize, end_id: usize) {
+        for id in start_id..end_id {
+            // Using &self.store is safe because we implemented the Storage trait!
+            self.index.insert(id, &self.store);
+        }
+    }
+
+    /// Search the database from Python: results = db.search(my_query_list, 5)
+    fn search(&self, query: Vec<f32>, k: usize) -> PyResult<Vec<(usize, f32)>> {
+        let results = self.index.search(&query, k, &self.store);
+        Ok(results)
+    }
+
+    /// Helper to check how many vectors are mapped
+    fn len(&self) -> usize {
+        self.store.len()
+    }
+}
+
+#[pymodule]
+fn my_vector_db(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<VectorDB>()?;
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -440,12 +504,48 @@ mod tests {
             id: 99,
             data: vec![0.0, 0.0],
         };
-        let results = index.search(&query, 2, &store);
+        let results = index.search(&query.data, 2, &store);
 
         assert_eq!(results.len(), 2);
 
         // The closest should be id 0 (1.0, 1.0), followed by id 1 (2.0, 2.0)
         assert_eq!(results[0].0, 0);
         assert_eq!(results[1].0, 1);
+    }
+    #[test]
+    fn test_mmap_disk_store() {
+        use crate::Storage;
+        use crate::disk_store::MmapVectorStore; // Ensure the trait is in scope
+
+        let file_path = "mock_data.bin";
+        let dimensions = 384;
+
+        // 1. Instantly map the 153MB file to virtual memory
+        let store = MmapVectorStore::open(file_path, dimensions)
+            .expect("Failed to open mmap file. Did you run the python script?");
+
+        // 2. Verify the OS mapped the correct number of vectors
+        assert_eq!(store.len(), 100_000);
+
+        // 3. Trigger a Page Fault: Read the 50,000th vector directly from SSD
+        let mid_vector = store.get_vector(50_000);
+        assert_eq!(mid_vector.len(), dimensions);
+
+        // 4. Test the HNSW index with the disk-backed store
+        let mut index = HnswIndex::new(16, 32);
+
+        // We'll just insert the first 1,000 vectors so the test runs fast
+        for i in 0..1000 {
+            index.insert(i, &store);
+        }
+
+        // Search for the closest vectors to the 500th vector
+        let query_vec = store.get_vector(500);
+        let results = index.search(query_vec, 5, &store);
+
+        // The closest result should logically be itself (ID 500), with a distance of 0.0
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, 500);
+        assert!(results[0].1 < 0.0001); // Distance should be practically zero
     }
 }

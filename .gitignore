@@ -1,1 +1,25 @@
 /target
+# --- Rust ---
+target/
+Cargo.lock
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# --- Compiled Dynamic Libraries (PyO3) ---
+*.so
+*.dylib
+*.pyd
+
+# --- Project Data (DO NOT PUSH MASSIVE FILES) ---
+*.bin
+mock_data.bin
+
+# --- OS Generated ---
+.DS_Store
+Thumbs.db
